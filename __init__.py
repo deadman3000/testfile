@@ -5,6 +5,8 @@ import traceback
 import torch
 import torch.nn.functional as F
 
+from .rhythm_report_helper import analyze_events
+
 
 class YuE2RhythmReferenceDiagnostic:
     """
@@ -68,7 +70,6 @@ class YuE2RhythmReferenceDiagnostic:
 
         if waveform is None:
             raise ValueError("The AUDIO input has no 'waveform'.")
-
         if not isinstance(waveform, torch.Tensor):
             raise TypeError(
                 "The audio waveform is not a PyTorch tensor."
@@ -95,7 +96,6 @@ class YuE2RhythmReferenceDiagnostic:
             # Standard ComfyUI shape: [batch, channels, samples].
             # Use the first audio item if the batch contains more than one.
             waveform = waveform[0]
-
         elif waveform.ndim == 2:
             # Common shape: [channels, samples] or [batch, samples].
             # At this point ComfyUI audio is expected to be channel-first.
@@ -154,6 +154,9 @@ class YuE2RhythmReferenceDiagnostic:
         for audio encoders. A two-dimensional [batch, samples] tensor is
         tried if the model rejects the first shape with a dimensionality
         or indexing error.
+
+        Return the successful event list so the rhythm helper can analyse
+        it without running transcription a second time.
         """
         method = getattr(model, "transcribe", None)
 
@@ -162,11 +165,13 @@ class YuE2RhythmReferenceDiagnostic:
                 "\nTRANSCRIPTION TEST\n"
                 "No callable transcribe() method was found on the model."
             )
-            return
+            return None
 
         try:
             signature = inspect.signature(method)
-            report.append(f"\nTRANSCRIPTION TEST\ntranscribe signature: {signature}")
+            report.append(
+                f"\nTRANSCRIPTION TEST\ntranscribe signature: {signature}"
+            )
         except Exception as exc:
             report.append(
                 "\nTRANSCRIPTION TEST\n"
@@ -209,7 +214,9 @@ class YuE2RhythmReferenceDiagnostic:
                 report.append(
                     "Result preview: " + self._short_repr(result)
                 )
-                return
+
+                # Return the events rather than discarding them.
+                return result
 
             except (IndexError, ValueError) as exc:
                 last_error = exc
@@ -234,7 +241,6 @@ class YuE2RhythmReferenceDiagnostic:
                     and any(
                         word in message
                         for word in (
-                            "dimension",
                             "dimension",
                             "shape",
                             "index",
@@ -261,6 +267,8 @@ class YuE2RhythmReferenceDiagnostic:
                 "The installed model may require additional preprocessing "
                 "or a different method than transcribe()."
             )
+
+        return None
 
     def diagnose(self, audio_encoder, audio, abc):
         report = [
@@ -297,6 +305,8 @@ class YuE2RhythmReferenceDiagnostic:
             report.append("AUDIO INSPECTION FAILED")
             report.append(f"{type(exc).__name__}: {exc}")
             report.append(traceback.format_exc())
+            report.append("")
+            report.append("END OF REPORT")
             return (abc, "\n".join(report))
 
         # Inspect the connected SheetSage2 encoder.
@@ -313,11 +323,12 @@ class YuE2RhythmReferenceDiagnostic:
         )
 
         model = getattr(audio_encoder, "model", None)
-
         if model is None:
             report.append(
                 "No underlying .model attribute was found on the encoder."
             )
+            report.append("")
+            report.append("END OF REPORT")
             return (abc, "\n".join(report))
 
         report.append(f"Underlying model class: {type(model).__name__}")
@@ -362,13 +373,16 @@ class YuE2RhythmReferenceDiagnostic:
                 f"Prepared samples: {prepared.numel()}"
             )
             report.append(
-                f"Prepared duration: {prepared.numel() / target_rate:.2f} seconds"
+                f"Prepared duration: "
+                f"{prepared.numel() / target_rate:.2f} seconds"
             )
 
         except Exception as exc:
             report.append("WAVEFORM PREPARATION FAILED")
             report.append(f"{type(exc).__name__}: {exc}")
             report.append(traceback.format_exc())
+            report.append("")
+            report.append("END OF REPORT")
             return (abc, "\n".join(report))
 
         # Prefer the encoder's configured load device, if present.
@@ -389,16 +403,39 @@ class YuE2RhythmReferenceDiagnostic:
                 "No manual model load/unload was requested by this node."
             )
 
-        self._run_transcription(
+        # Run transcription once and keep the resulting events.
+        events = self._run_transcription(
             model,
             prepared,
             device,
             report,
         )
 
+        # Analyse the existing transcription events.
+        if isinstance(events, (list, tuple)):
+            try:
+                rhythm_result = analyze_events(events)
+
+                report.append("")
+                report.append(rhythm_result["text"])
+
+            except Exception as exc:
+                report.append("")
+                report.append("RHYTHM HELPER FAILED")
+                report.append(f"{type(exc).__name__}: {exc}")
+                report.append(traceback.format_exc())
+
+        else:
+            report.append("")
+            report.append(
+                "Rhythm analysis skipped: "
+                "transcription returned no event list."
+            )
+
         report.append("")
         report.append("END OF REPORT")
 
+        # Pass the original ABC string through unchanged.
         return (abc, "\n".join(report))
 
 
