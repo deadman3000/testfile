@@ -5,7 +5,7 @@ import traceback
 import torch
 import torch.nn.functional as F
 
-from .rhythm_report_helper import analyze_events
+from .rhythm_report_helper import analyze_events, analyze_audio_onsets
 
 
 class YuE2RhythmReferenceDiagnostic:
@@ -103,7 +103,6 @@ class YuE2RhythmReferenceDiagnostic:
                 waveform = waveform.mean(dim=0)
             else:
                 waveform = waveform[0]
-
         elif waveform.ndim != 1:
             raise ValueError(
                 "Unsupported waveform dimensions: "
@@ -148,12 +147,7 @@ class YuE2RhythmReferenceDiagnostic:
 
     def _run_transcription(self, model, waveform, device, report):
         """
-        Try the likely audio tensor shapes used by audio models.
-
-        The first attempt is [batch, channel, samples], which is common
-        for audio encoders. A two-dimensional [batch, samples] tensor is
-        tried if the model rejects the first shape with a dimensionality
-        or indexing error.
+        Try likely audio tensor shapes used by audio models.
 
         Return the successful event list so the rhythm helper can analyse
         it without running transcription a second time.
@@ -282,7 +276,6 @@ class YuE2RhythmReferenceDiagnostic:
         # Inspect reference audio.
         try:
             waveform, sample_rate = self._get_audio_details(audio)
-
             report.append("AUDIO INSPECTION")
             report.append(f"Sample rate: {sample_rate}")
             report.append(
@@ -317,9 +310,7 @@ class YuE2RhythmReferenceDiagnostic:
         )
         report.append(
             "Encoder attributes: "
-            + ", ".join(
-                self._describe_attributes(audio_encoder)
-            )
+            + ", ".join(self._describe_attributes(audio_encoder))
         )
 
         model = getattr(audio_encoder, "model", None)
@@ -369,9 +360,7 @@ class YuE2RhythmReferenceDiagnostic:
                     "Resampling method: PyTorch linear interpolation."
                 )
 
-            report.append(
-                f"Prepared samples: {prepared.numel()}"
-            )
+            report.append(f"Prepared samples: {prepared.numel()}")
             report.append(
                 f"Prepared duration: "
                 f"{prepared.numel() / target_rate:.2f} seconds"
@@ -393,8 +382,7 @@ class YuE2RhythmReferenceDiagnostic:
 
         report.append(f"Selected model device: {device}")
 
-        # The encoder may use a ComfyUI model patcher. Report it, but do not
-        # force-load or unload models from this diagnostic node.
+        # Report patcher state but do not force-load or unload models.
         patcher = getattr(audio_encoder, "patcher", None)
 
         if patcher is not None:
@@ -403,7 +391,7 @@ class YuE2RhythmReferenceDiagnostic:
                 "No manual model load/unload was requested by this node."
             )
 
-        # Run transcription once and keep the resulting events.
+        # Run transcription once and retain its result.
         events = self._run_transcription(
             model,
             prepared,
@@ -411,11 +399,12 @@ class YuE2RhythmReferenceDiagnostic:
             report,
         )
 
-        # Analyse the existing transcription events.
+        # Existing symbolic analysis.
+        rhythm_result = None
+
         if isinstance(events, (list, tuple)):
             try:
                 rhythm_result = analyze_events(events)
-
                 report.append("")
                 report.append(rhythm_result["text"])
 
@@ -431,6 +420,31 @@ class YuE2RhythmReferenceDiagnostic:
                 "Rhythm analysis skipped: "
                 "transcription returned no event list."
             )
+
+        # New independent audio onset analysis.
+        # Uses the original waveform, not the resampled model input.
+        try:
+            estimated_bpm = (
+                rhythm_result.get("median_bpm")
+                if isinstance(rhythm_result, dict)
+                else None
+            )
+
+            audio_result = analyze_audio_onsets(
+                mono,
+                sample_rate,
+                bpm=estimated_bpm,
+                beat_offset=0.0,
+            )
+
+            report.append("")
+            report.append(audio_result["text"])
+
+        except Exception as exc:
+            report.append("")
+            report.append("AUDIO ONSET ANALYSIS FAILED")
+            report.append(f"{type(exc).__name__}: {exc}")
+            report.append(traceback.format_exc())
 
         report.append("")
         report.append("END OF REPORT")
