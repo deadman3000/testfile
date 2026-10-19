@@ -8,6 +8,7 @@ It does not load models, process audio, change ABC, or run transcription.
 
 from collections import Counter
 from statistics import median
+from .rhythm_report_helper import analyze_events
 
 
 def _meter(value):
