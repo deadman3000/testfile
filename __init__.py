@@ -1,462 +1,220 @@
 
-import inspect
-import traceback
+"""SeedVR2 image-space multiplier bridge for ComfyUI.
+
+Decode a source image latent, resize the decoded pixels in image space, then
+encode with the SeedVR2 VAE. A user-entered short-side value sets the base
+short-side resolution; the multiplier scales it. The long side is calculated
+from the decoded image aspect ratio, and both dimensions are aligned to 16 px.
+"""
 
 import torch
 import torch.nn.functional as F
 
-from .rhythm_report_helper import analyze_events, analyze_audio_onsets
 
-
-class YuE2RhythmReferenceDiagnostic:
-    """
-    Diagnostic node for inspecting the SheetSage2 audio encoder,
-    testing reference-audio transcription, and passing ABC through unchanged.
-
-    This node does not modify ABC or generate music.
-    """
+class SeedVR2ImageSpaceMultiplierBridge:
+    SCALE_METHODS = ["bilinear", "bicubic", "lanczos", "nearest", "nearest-exact", "area"]
+    PIXEL_ALIGNMENT = 16
 
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "audio_encoder": ("AUDIO_ENCODER",),
-                "audio": ("AUDIO",),
-                "abc": (
-                    "STRING",
-                    {
-                        "default": "",
-                        "multiline": True,
-                    },
-                ),
+                "samples": ("LATENT",),
+                "image_vae": ("VAE",),
+                "seedvr2_vae": ("VAE",),
+                # Keep the original widget order intact for saved workflow compatibility.
+                "multiplier": ("FLOAT", {
+                    "default": 1.0,
+                    "min": 1.0,
+                    "max": 4.0,
+                    "step": 0.1,
+                    "round": 0.1,
+                }),
+                "scaling_method": (cls.SCALE_METHODS, {"default": "lanczos"}),
+                # New widget goes last so existing saved widget values keep their positions.
+                "short_side": ("INT", {
+                    "default": 0,
+                    "min": 0,
+                    "max": 16384,
+                    "step": 16,
+                    "display": "number",
+                    "tooltip": "Base short-side size in pixels. Set to 0 to use the decoded image's current short side.",
+                }),
             }
         }
 
-    RETURN_TYPES = ("STRING", "STRING")
-    RETURN_NAMES = ("abc_passthrough", "analysis_report")
-    FUNCTION = "diagnose"
-    CATEGORY = "YuE2/Diagnostics"
+    RETURN_TYPES = ("LATENT", "STRING", "IMAGE")
+    RETURN_NAMES = ("seedvr2_latent", "output_resolution", "reference_image")
+    FUNCTION = "convert"
+    CATEGORY = "latent/SeedVR2"
+    DESCRIPTION = (
+        "Decodes the source latent, resizes pixels using short_side × multiplier while "
+        "preserving aspect ratio, aligns dimensions to 16 pixels, and encodes with the "
+        "SeedVR2 VAE. The output_resolution string can be connected to a Show Text node. "
+        "Set short_side to 0 to use the decoded image's original short side."
+    )
+
+    @classmethod
+    def _target_dimension(cls, value, alignment=None):
+        """Round a pixel dimension to the nearest aligned size."""
+        if alignment is None:
+            alignment = cls.PIXEL_ALIGNMENT
+        return max(alignment, int(round(value / alignment)) * alignment)
+
+    @classmethod
+    def _target_size(cls, height, width, short_side, multiplier):
+        """Calculate aligned output dimensions from short side and aspect ratio."""
+        actual_short = min(height, width)
+        actual_long = max(height, width)
+        base_short = actual_short if int(short_side) == 0 else int(short_side)
+        target_short = base_short * float(multiplier)
+        target_long = target_short * (actual_long / actual_short)
+
+        short_dim = cls._target_dimension(target_short)
+        long_dim = cls._target_dimension(target_long)
+        if height <= width:
+            return short_dim, long_dim
+        return long_dim, short_dim
 
     @staticmethod
-    def _short_repr(value, limit=1500):
-        """Convert a result to readable text without flooding the report."""
-        try:
-            text = repr(value)
-        except Exception:
-            text = f"<unprintable {type(value).__name__}>"
+    def _resize_image(image, target_h, target_w, method):
+        # ComfyUI IMAGE layout is [B,H,W,C]. Interpolate in channel-first layout.
+        original_dtype = image.dtype
+        nchw = image[..., :3].permute(0, 3, 1, 2)
+        work = nchw.float() if nchw.dtype in (torch.float16, torch.bfloat16) else nchw
 
-        if len(text) > limit:
-            text = text[:limit] + "... [truncated]"
-
-        return text
-
-    @staticmethod
-    def _get_audio_details(audio):
-        """
-        Extract the standard ComfyUI AUDIO structure:
-        {
-            'waveform': tensor [batch, channels, samples],
-            'sample_rate': int
-        }
-        """
-        if not isinstance(audio, dict):
-            raise TypeError(
-                "Expected a ComfyUI AUDIO dictionary, "
-                f"received {type(audio).__name__}."
-            )
-
-        waveform = audio.get("waveform")
-        sample_rate = audio.get("sample_rate")
-
-        if waveform is None:
-            raise ValueError("The AUDIO input has no 'waveform'.")
-        if not isinstance(waveform, torch.Tensor):
-            raise TypeError(
-                "The audio waveform is not a PyTorch tensor."
-            )
-
-        if waveform.numel() == 0:
-            raise ValueError("The audio waveform is empty.")
-
-        if sample_rate is None:
-            raise ValueError("The AUDIO input has no sample rate.")
-
-        return waveform, int(sample_rate)
-
-    @staticmethod
-    def _prepare_waveform(waveform, original_rate, target_rate):
-        """
-        Convert ComfyUI audio to mono, resample if required, and return
-        a one-dimensional waveform. Batch/channel dimensions are added
-        separately when testing the model.
-        """
-        waveform = waveform.detach().to(dtype=torch.float32)
-
-        if waveform.ndim == 3:
-            # Standard ComfyUI shape: [batch, channels, samples].
-            # Use the first audio item if the batch contains more than one.
-            waveform = waveform[0]
-        elif waveform.ndim == 2:
-            # Common shape: [channels, samples] or [batch, samples].
-            # At this point ComfyUI audio is expected to be channel-first.
-            if waveform.shape[0] > 1:
-                waveform = waveform.mean(dim=0)
-            else:
-                waveform = waveform[0]
-        elif waveform.ndim != 1:
-            raise ValueError(
-                "Unsupported waveform dimensions: "
-                f"{list(waveform.shape)}"
-            )
-
-        # Convert multi-channel audio to mono when still applicable.
-        if waveform.ndim == 2:
-            waveform = waveform.mean(dim=0)
-
-        original_length = waveform.numel()
-
-        if original_rate != target_rate:
-            target_length = max(
-                1,
-                round(original_length * target_rate / original_rate),
-            )
-
-            waveform = F.interpolate(
-                waveform.reshape(1, 1, -1),
-                size=target_length,
-                mode="linear",
-                align_corners=False,
-            ).reshape(-1)
-
-        return waveform, original_length
-
-    @staticmethod
-    def _describe_attributes(obj, exclude_private=True, limit=80):
-        if obj is None:
-            return ["Object is None."]
-
-        try:
-            names = dir(obj)
-        except Exception as exc:
-            return [f"Could not inspect attributes: {exc}"]
-
-        if exclude_private:
-            names = [name for name in names if not name.startswith("_")]
-
-        return names[:limit]
-
-    def _run_transcription(self, model, waveform, device, report):
-        """
-        Try likely audio tensor shapes used by audio models.
-
-        Return the successful event list so the rhythm helper can analyse
-        it without running transcription a second time.
-        """
-        method = getattr(model, "transcribe", None)
-
-        if not callable(method):
-            report.append(
-                "\nTRANSCRIPTION TEST\n"
-                "No callable transcribe() method was found on the model."
-            )
-            return None
-
-        try:
-            signature = inspect.signature(method)
-            report.append(
-                f"\nTRANSCRIPTION TEST\ntranscribe signature: {signature}"
-            )
-        except Exception as exc:
-            report.append(
-                "\nTRANSCRIPTION TEST\n"
-                f"Could not inspect transcribe signature: {exc}"
-            )
-
-        try:
-            device = torch.device(device)
-        except Exception:
-            device = torch.device("cpu")
-
-        report.append(f"Input device: {device}")
-        report.append(
-            f"Prepared waveform shape: {list(waveform.shape)}"
-        )
-
-        candidates = [
-            ("[batch, channel, samples]", waveform.reshape(1, 1, -1)),
-            ("[batch, samples]", waveform.reshape(1, -1)),
-        ]
-
-        last_error = None
-
-        for shape_name, candidate in candidates:
-            try:
-                candidate = candidate.to(device)
-
-                report.append(
-                    f"Trying transcribe() with shape {shape_name}: "
-                    f"{list(candidate.shape)}"
+        if method == "lanczos":
+            def lanczos_weights(input_size, output_size, device):
+                scale = input_size / output_size
+                filter_scale = max(scale, 1.0)
+                positions = (
+                    (torch.arange(output_size, device=device, dtype=torch.float32) + 0.5)
+                    * scale - 0.5
                 )
-
-                with torch.inference_mode():
-                    result = method(candidate)
-
-                report.append("Transcription call succeeded.")
-                report.append(
-                    "Result type: " + type(result).__name__
+                source = torch.arange(input_size, device=device, dtype=torch.float32)
+                distance = (positions[:, None] - source[None, :]) / filter_scale
+                weights = torch.sinc(distance) * torch.sinc(distance / 3.0)
+                weights = torch.where(
+                    distance.abs() < 3.0,
+                    weights,
+                    torch.zeros_like(weights),
                 )
-                report.append(
-                    "Result preview: " + self._short_repr(result)
-                )
+                weights = weights / weights.sum(dim=1, keepdim=True).clamp_min(1e-12)
+                return weights
 
-                # Return the events rather than discarding them.
-                return result
-
-            except (IndexError, ValueError) as exc:
-                last_error = exc
-                report.append(
-                    f"Attempt with {shape_name} failed: "
-                    f"{type(exc).__name__}: {exc}"
-                )
-
-            except Exception as exc:
-                last_error = exc
-                report.append(
-                    f"Attempt with {shape_name} failed: "
-                    f"{type(exc).__name__}: {exc}"
-                )
-
-                # Try the alternate dimensionality only for likely
-                # shape/indexing errors. Do not repeatedly run inference
-                # after unrelated errors.
-                message = str(exc).lower()
-                shape_related = (
-                    isinstance(exc, (RuntimeError, IndexError, ValueError))
-                    and any(
-                        word in message
-                        for word in (
-                            "dimension",
-                            "shape",
-                            "index",
-                            "size",
-                            "channel",
-                            "expected",
-                        )
-                    )
-                )
-
-                if not shape_related:
-                    break
-
-        if last_error is not None:
-            report.append(
-                "\nTranscription could not be completed with the "
-                "tested waveform shapes."
-            )
-            report.append(
-                "Final exception: "
-                f"{type(last_error).__name__}: {last_error}"
-            )
-            report.append(
-                "The installed model may require additional preprocessing "
-                "or a different method than transcribe()."
-            )
-
-        return None
-
-    def diagnose(self, audio_encoder, audio, abc):
-        report = [
-            "YuE2 RHYTHM REFERENCE DIAGNOSTIC",
-            "Diagnostic node; model compatibility is not guaranteed.",
-            "The ABC output is passed through unchanged.",
-            "This node does not modify ABC or generate music.",
-            "",
-        ]
-
-        # Inspect reference audio.
-        try:
-            waveform, sample_rate = self._get_audio_details(audio)
-            report.append("AUDIO INSPECTION")
-            report.append(f"Sample rate: {sample_rate}")
-            report.append(
-                f"Original waveform shape: {list(waveform.shape)}"
-            )
-
-            if waveform.ndim == 3:
-                mono = waveform[0].mean(dim=0)
-            elif waveform.ndim == 2:
-                mono = waveform.mean(dim=0)
-            else:
-                mono = waveform
-
-            report.append(f"Mono waveform shape: {list(mono.shape)}")
-            report.append(
-                f"Duration: {mono.numel() / sample_rate:.2f} seconds"
-            )
-
-        except Exception as exc:
-            report.append("AUDIO INSPECTION FAILED")
-            report.append(f"{type(exc).__name__}: {exc}")
-            report.append(traceback.format_exc())
-            report.append("")
-            report.append("END OF REPORT")
-            return (abc, "\n".join(report))
-
-        # Inspect the connected SheetSage2 encoder.
-        report.append("")
-        report.append("ENCODER INSPECTION")
-        report.append(
-            f"Encoder class: {type(audio_encoder).__name__}"
-        )
-        report.append(
-            "Encoder attributes: "
-            + ", ".join(self._describe_attributes(audio_encoder))
-        )
-
-        model = getattr(audio_encoder, "model", None)
-        if model is None:
-            report.append(
-                "No underlying .model attribute was found on the encoder."
-            )
-            report.append("")
-            report.append("END OF REPORT")
-            return (abc, "\n".join(report))
-
-        report.append(f"Underlying model class: {type(model).__name__}")
-        report.append(
-            "Model attributes: "
-            + ", ".join(self._describe_attributes(model))
-        )
-
-        target_rate = getattr(
-            audio_encoder,
-            "model_sample_rate",
-            None,
-        )
-
-        if target_rate is None:
-            target_rate = getattr(model, "sample_rate", sample_rate)
-
-        try:
-            target_rate = int(target_rate)
-        except Exception:
-            target_rate = sample_rate
-
-        report.append(f"Model sample rate: {target_rate}")
-
-        try:
-            prepared, original_length = self._prepare_waveform(
-                waveform,
-                sample_rate,
-                target_rate,
-            )
-
-            if sample_rate != target_rate:
-                report.append(
-                    f"Resampled waveform: {sample_rate} Hz -> "
-                    f"{target_rate} Hz"
-                )
-                report.append(
-                    "Resampling method: PyTorch linear interpolation."
-                )
-
-            report.append(f"Prepared samples: {prepared.numel()}")
-            report.append(
-                f"Prepared duration: "
-                f"{prepared.numel() / target_rate:.2f} seconds"
-            )
-
-        except Exception as exc:
-            report.append("WAVEFORM PREPARATION FAILED")
-            report.append(f"{type(exc).__name__}: {exc}")
-            report.append(traceback.format_exc())
-            report.append("")
-            report.append("END OF REPORT")
-            return (abc, "\n".join(report))
-
-        # Prefer the encoder's configured load device, if present.
-        device = getattr(audio_encoder, "load_device", None)
-
-        if device is None:
-            device = getattr(model, "device", "cpu")
-
-        report.append(f"Selected model device: {device}")
-
-        # Report patcher state but do not force-load or unload models.
-        patcher = getattr(audio_encoder, "patcher", None)
-
-        if patcher is not None:
-            report.append("ComfyUI model patcher detected.")
-            report.append(
-                "No manual model load/unload was requested by this node."
-            )
-
-        # Run transcription once and retain its result.
-        events = self._run_transcription(
-            model,
-            prepared,
-            device,
-            report,
-        )
-
-        # Existing symbolic analysis.
-        rhythm_result = None
-
-        if isinstance(events, (list, tuple)):
-            try:
-                rhythm_result = analyze_events(events)
-                report.append("")
-                report.append(rhythm_result["text"])
-
-            except Exception as exc:
-                report.append("")
-                report.append("RHYTHM HELPER FAILED")
-                report.append(f"{type(exc).__name__}: {exc}")
-                report.append(traceback.format_exc())
-
+            hw = lanczos_weights(work.shape[-2], target_h, work.device)
+            ww = lanczos_weights(work.shape[-1], target_w, work.device)
+            resized = torch.einsum("oh,bchw->bcow", hw, work)
+            resized = torch.einsum("bcow,pw->bcop", resized, ww)
         else:
-            report.append("")
-            report.append(
-                "Rhythm analysis skipped: "
-                "transcription returned no event list."
+            kwargs = {"size": (target_h, target_w), "mode": method}
+            if method in ("bilinear", "bicubic"):
+                kwargs["align_corners"] = False
+            resized = F.interpolate(work, **kwargs)
+
+        return resized.to(original_dtype).permute(0, 2, 3, 1).contiguous()
+
+    def convert(
+        self,
+        samples,
+        image_vae,
+        seedvr2_vae,
+        multiplier=1.0,
+        scaling_method="lanczos",
+        short_side=0,
+    ):
+        if not isinstance(samples, dict) or "samples" not in samples:
+            raise ValueError("Input must be a ComfyUI LATENT containing a 'samples' tensor.")
+
+        image_latent = samples["samples"]
+        if getattr(image_latent, "is_nested", False):
+            nested = image_latent.unbind()
+            if len(nested) != 1:
+                raise ValueError("Nested latent input must contain exactly one image latent.")
+            image_latent = nested[0]
+
+        # Qwen Image VAE in this ComfyUI path expects video-style latent layout
+        # [B,C,T,H,W], even when processing a single still image. Preserve an
+        # existing T=1 dimension, or add it to a conventional 4-D image latent.
+        if image_latent.ndim == 4:
+            image_latent = image_latent.unsqueeze(2)
+        elif image_latent.ndim == 5:
+            if image_latent.shape[2] != 1:
+                raise ValueError(
+                    "This bridge supports still images only. Expected a 5-D latent with T=1, "
+                    f"but received shape {tuple(image_latent.shape)}."
+                )
+        else:
+            raise ValueError(
+                "Expected a 4-D image latent [B,C,H,W] or 5-D single-frame latent [B,C,1,H,W], "
+                f"but received shape {tuple(image_latent.shape)}."
             )
 
-        # New independent audio onset analysis.
-        # Uses the original waveform, not the resampled model input.
-        try:
-            estimated_bpm = (
-                rhythm_result.get("median_bpm")
-                if isinstance(rhythm_result, dict)
-                else None
+        factor = float(multiplier)
+        if not 1.0 <= factor <= 4.0:
+            raise ValueError(f"multiplier must be between 1.0 and 4.0, got {factor}.")
+        if int(short_side) < 0 or int(short_side) > 16384:
+            raise ValueError(f"short_side must be between 0 and 16384, got {short_side}.")
+        if scaling_method not in self.SCALE_METHODS:
+            raise ValueError(f"Unsupported scaling_method: {scaling_method}.")
+
+        image = image_vae.decode(image_latent)
+
+        # Qwen Image VAE may return a single-frame tensor in [B,T,H,W,C].
+        # Remove the frame dimension only when T == 1.
+        if image.ndim == 5:
+            if image.shape[1] != 1:
+                raise ValueError(
+                    "Image VAE returned multiple frames where a still image was expected; "
+                    f"received shape {tuple(image.shape)}."
+                )
+            image = image[:, 0, :, :, :]
+
+        # Accept standard ComfyUI IMAGE tensors [B,H,W,C] after normalizing
+        # the single-frame Qwen output above.
+        if image.ndim != 4 or image.shape[-1] < 3:
+            raise ValueError(
+                "Image VAE did not return an IMAGE tensor in [B,H,W,C] layout "
+                "or a single-frame [B,1,H,W,C] tensor; "
+                f"received shape {tuple(image.shape)}."
             )
 
-            audio_result = analyze_audio_onsets(
-                mono,
-                sample_rate,
-                bpm=estimated_bpm,
-                beat_offset=0.0,
+        image = image[..., :3]
+
+        old_h, old_w = image.shape[1:3]
+        target_h, target_w = self._target_size(
+            old_h, old_w, short_side, factor
+        )
+        if (target_h, target_w) != (old_h, old_w):
+            image = self._resize_image(image, target_h, target_w, scaling_method)
+
+        output_resolution = f"{target_w} × {target_h}"
+        # Match official SeedVR2 preprocessing before VAE encoding.
+        # Keep `image` unchanged for the reference_image output.
+        seedvr2_input = image.clamp(0.0, 1.0)
+        seedvr2_latent = seedvr2_vae.encode(seedvr2_input)
+
+        if seedvr2_latent.ndim != 5:
+            raise ValueError(
+                "SeedVR2 VAE encode should return a 5-D video latent [B,C,T,H,W], "
+                f"but returned shape {tuple(seedvr2_latent.shape)}. Check that the "
+                "selected VAE is the SeedVR2 VAE."
+            )
+        if seedvr2_latent.shape[1] != 16:
+            raise ValueError(
+                "SeedVR2 VAE encode returned an unexpected channel count: "
+                f"shape {tuple(seedvr2_latent.shape)}. SeedVR2 expects 16 latent channels. "
+                "Check the VAE connection and ComfyUI/SeedVR2 versions."
             )
 
-            report.append("")
-            report.append(audio_result["text"])
+        return ({"samples": seedvr2_latent}, output_resolution, image)
 
-        except Exception as exc:
-            report.append("")
-            report.append("AUDIO ONSET ANALYSIS FAILED")
-            report.append(f"{type(exc).__name__}: {exc}")
-            report.append(traceback.format_exc())
 
-        report.append("")
-        report.append("END OF REPORT")
-
-        # Pass the original ABC string through unchanged.
-        return (abc, "\n".join(report))
-
+WEB_DIRECTORY = "./js"
 
 NODE_CLASS_MAPPINGS = {
-    "YuE2RhythmReferenceDiagnostic": YuE2RhythmReferenceDiagnostic,
+    "SeedVR2ImageSpaceMultiplierBridge": SeedVR2ImageSpaceMultiplierBridge
 }
-
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "YuE2RhythmReferenceDiagnostic": "YuE2 Rhythm Reference Diagnostic",
+    "SeedVR2ImageSpaceMultiplierBridge": "SeedVR2 Image-Space Multiplier Bridge"
 }
